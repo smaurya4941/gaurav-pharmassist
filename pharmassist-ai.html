@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PharmAssist AI: Offline Clinical Decision Support</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        medical: { 50: '#f0fdfa', 100: '#ccfbf1', 500: '#14b8a6', 600: '#0d9488', 700: '#0f766e', 900: '#134e4a' }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { background-color: #f8fafc; color: #0f172a; -webkit-font-smoothing: antialiased; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeInScale { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
+        .animate-fade-in { animation: fadeIn 0.4s ease-out forwards; }
+        .animate-modal { animation: fadeInScale 0.25s ease-out forwards; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        @media print {
+            body { background: white !important; font-size: 14pt !important; }
+            .print-hidden, nav, .tabs-nav, .search-col { display: none !important; }
+            .output-col { grid-column: span 3 !important; width: 100% !important; max-width: 100% !important; margin: 0 !important; }
+            .result-card { box-shadow: none !important; border: 2px solid #cbd5e1 !important; page-break-inside: avoid !important; }
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useMemo } = React;
+
+        // ==========================================
+        // 1. ALIAS MAP & HELPERS
+        // ==========================================
+        const ALIAS_MAP = {
+            "Dolo 650": "Paracetamol", "Crocin": "Paracetamol", "Calpol": "Paracetamol", "Tylenol": "Paracetamol",
+            "Augmentin": "Amoxicillin + Clavulanate", "Allegra": "Fexofenadine", "Combiflam": "Ibuprofen + Paracetamol",
+            "Pantocid": "Pantoprazole", "Advil": "Ibuprofen", "Motrin": "Ibuprofen"
+        };
+        const getGenericName = (val) => { if (!val) return ""; const m = val.match(/\(([^)]+)\)$/); return m ? m[1] : val; };
+        const speakText = (text) => { if ('speechSynthesis' in window) { window.speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); window.speechSynthesis.speak(u); } };
+
+        // ==========================================
+        // 2. DATABASES
+        // ==========================================
+        const DDI_DATABASE = [
+            { drugA: "Warfarin", drugB: "Aspirin", severity: "RED", mechanism: "Synergistic bleeding risk: Aspirin irreversibly inhibits COX-1 impairing platelet aggregation; Warfarin inhibits vitamin K-dependent clotting factors.", clinicalRisks: ["Major GI bleeding", "Intracranial hemorrhage"], management: ["Avoid concurrent use unless strictly indicated.", "Monitor INR frequently."] },
+            { drugA: "Sarpagandha", drugB: "MAO Inhibitors", severity: "RED", mechanism: "Reserpine depletes monoamines; MAOIs prevent breakdown. Causes massive accumulation and paradoxical sympathetic overactivity.", clinicalRisks: ["Hypertensive crisis", "Fatal arrhythmias"], management: ["Absolute contraindication. Do not co-administer."] },
+            { drugA: "Clopidogrel", drugB: "Omeprazole", severity: "RED", mechanism: "Omeprazole strongly inhibits CYP2C19, preventing the conversion of Clopidogrel into its active metabolite.", clinicalRisks: ["Increased risk of cardiovascular events", "Stent thrombosis"], management: ["Switch to Pantoprazole or Rabeprazole."] },
+            { drugA: "Simvastatin", drugB: "Clarithromycin", severity: "RED", mechanism: "Clarithromycin strongly inhibits CYP3A4, severely reducing the clearance of Simvastatin.", clinicalRisks: ["Rhabdomyolysis", "Acute renal failure"], management: ["Contraindicated. Suspend statin while on antibiotic."] },
+            { drugA: "Paracetamol", drugB: "Alcohol", severity: "RED", mechanism: "Alcohol induces CYP2E1 enzymes, increasing the conversion of Paracetamol to toxic NAPQI metabolite while depleting hepatic glutathione stores.", clinicalRisks: ["Severe hepatotoxicity", "Elevated liver enzymes", "Acute hepatic damage"], management: ["Avoid concurrent alcohol consumption.", "Do not exceed 2g paracetamol/day if chronic drinker."] },
+            { drugA: "Paracetamol", drugB: "Amoxicillin", severity: "GREEN", mechanism: "No significant interaction. Different metabolic pathways.", clinicalRisks: ["Standard drug specific risks"], management: ["Safe to co-administer."] },
+            { drugA: "Ibuprofen", drugB: "Paracetamol", severity: "GREEN", mechanism: "Different mechanisms and pathways. Often used synergistically for pain.", clinicalRisks: ["None specific to combination"], management: ["Safe to alternate or co-administer."] }
+        ];
+        const DOSING_DATABASE = [
+            { drugName: "Levothyroxine", bestTime: "Morning", foodTiming: "Empty stomach", instructions: "Take 30-60 mins before breakfast. Do not take within 4 hours of calcium or iron." },
+            { drugName: "Pantoprazole", bestTime: "Morning", foodTiming: "Empty stomach", instructions: "Take 30-60 minutes before the first meal of the day for maximal proton pump inhibition." },
+            { drugName: "Atorvastatin", bestTime: "Any time", foodTiming: "With or without food", instructions: "Has a long half-life, so can be taken morning or evening. Consistency is key." },
+            { drugName: "Simvastatin", bestTime: "Bedtime", foodTiming: "With or without food", instructions: "Must be taken in the evening/bedtime because cholesterol synthesis peaks at night." },
+            { drugName: "Montelukast", bestTime: "Bedtime", foodTiming: "With or without food", instructions: "Take in the evening to optimize efficacy against nighttime asthma symptoms." },
+            { drugName: "Metformin", bestTime: "With Meals", foodTiming: "With food", instructions: "Take strictly with food to minimize gastrointestinal upset." },
+            { drugName: "Warfarin", bestTime: "Evening", foodTiming: "With or without food", instructions: "Usually dosed at 4-6 PM so dosage can be adjusted based on morning INR lab results." }
+        ];
+        const FOOD_DATABASE = [
+            { drugName: "Atorvastatin", foodItem: "Grapefruit Juice", safetyVerdict: "Avoid", mechanism: "Inhibits intestinal CYP3A4, increasing statin bioavailability.", patientAdvice: "Avoid consuming grapefruit or grapefruit juice to prevent severe muscle damage." },
+            { drugName: "Fexofenadine", foodItem: "Orange / Apple Juice", safetyVerdict: "Avoid", mechanism: "Inhibits OATP1A2 intestinal transporters, decreasing drug absorption.", patientAdvice: "Take with plain water. Separate juice by at least 4 hours." },
+            { drugName: "Ciprofloxacin", foodItem: "Milk / Dairy / Calcium", safetyVerdict: "Avoid", mechanism: "Calcium chelates the fluoroquinolone, drastically reducing absorption.", patientAdvice: "Take 2 hours before or 4 hours after dairy." },
+            { drugName: "Levodopa", foodItem: "High-Protein Meals", safetyVerdict: "Space out", mechanism: "Proteins compete with L-dopa for LAT-1 intestinal and blood-brain barrier transport.", patientAdvice: "Take 30-60 mins before meals. Redistribute protein intake to the evening meal." },
+            { drugName: "Warfarin", foodItem: "Green Leafy Vegetables (Vitamin K)", safetyVerdict: "Space out", mechanism: "Vitamin K directly antagonizes the Vitamin K depletion caused by warfarin.", patientAdvice: "Maintain a consistent daily intake. Do not suddenly binge or avoid them." },
+            { drugName: "Phenelzine", foodItem: "Tyramine / Aged Cheese", safetyVerdict: "Avoid", mechanism: "Tyramine cannot be broken down due to MAO inhibition, triggering massive norepinephrine release.", patientAdvice: "Strictly avoid aged cheese, cured meats, and tap beer (Hypertensive crisis risk)." },
+            { drugName: "Paracetamol", foodItem: "Alcohol", safetyVerdict: "Avoid", mechanism: "Alcohol induces CYP2E1 enzymes, increasing the conversion of Paracetamol to toxic NAPQI metabolite.", patientAdvice: "Absolute avoidance of alcohol to prevent severe hepatotoxicity and liver damage." }
+        ];
+
+        const ddiDrugsList = Array.from(new Set([...DDI_DATABASE.flatMap(d => [d.drugA, d.drugB]), ...Object.keys(ALIAS_MAP)])).sort();
+        const dosingDrugsList = Array.from(new Set([...DOSING_DATABASE.map(d => d.drugName), ...Object.keys(ALIAS_MAP)])).sort();
+        const foodDrugsList = Array.from(new Set([...FOOD_DATABASE.map(d => d.drugName), ...Object.keys(ALIAS_MAP)])).sort();
+        const foodItemsList = Array.from(new Set([...FOOD_DATABASE.map(d => d.foodItem)])).sort();
+        const ddiKnownGenerics = new Set(DDI_DATABASE.flatMap(d => [d.drugA.toLowerCase(), d.drugB.toLowerCase()]));
+        const dosingKnownGenerics = new Set(DOSING_DATABASE.map(d => d.drugName.toLowerCase()));
+        const foodKnownDrugs = new Set(FOOD_DATABASE.map(d => d.drugName.toLowerCase()));
+        const foodKnownItems = new Set(FOOD_DATABASE.map(d => d.foodItem.toLowerCase()));
+
+        // ==========================================
+        // 3. MODAL CONTENT DATA
+        // ==========================================
+        const MODAL_DATA = {
+            rx: {
+                title: "📜 Prescription Abbreviation Decoder",
+                content: [
+                    { abbr: "b.i.d.", meaning: "Twice daily (bis in die)" },
+                    { abbr: "t.i.d.", meaning: "Three times daily (ter in die)" },
+                    { abbr: "q.i.d.", meaning: "Four times daily (quater in die)" },
+                    { abbr: "a.c.", meaning: "Before meals (ante cibum)" },
+                    { abbr: "p.c.", meaning: "After meals (post cibum)" },
+                    { abbr: "h.s.", meaning: "At bedtime (hora somni)" },
+                    { abbr: "s.o.s.", meaning: "If needed / emergency (si opus sit)" },
+                    { abbr: "p.r.n.", meaning: "As needed (pro re nata)" },
+                    { abbr: "q.d.", meaning: "Once daily (quaque die)" },
+                    { abbr: "stat.", meaning: "Immediately (statim)" },
+                    { abbr: "p.o.", meaning: "By mouth (per os)" },
+                    { abbr: "NPO", meaning: "Nothing by mouth (nil per os)" }
+                ]
+            },
+            storage: {
+                title: "📦 Drug Storage & Stability Guide",
+                tips: [
+                    { icon: "🚿", rule: "Never store medications in a humid bathroom cabinet. Moisture degrades tablets." },
+                    { icon: "❄️", rule: "Insulin and most eye drops require refrigeration (2-8°C). Do not freeze." },
+                    { icon: "☀️", rule: "Keep medicines away from direct sunlight. UV light accelerates chemical degradation." },
+                    { icon: "🔒", rule: "Store all medications out of children's reach, ideally in a locked cabinet." },
+                    { icon: "📅", rule: "Discard liquid antibiotics 7-14 days after reconstitution, even if unused." },
+                    { icon: "💊", rule: "Keep tablets in their original blister packs until use to protect from moisture and light." }
+                ]
+            },
+            chemistry: {
+                title: "🔬 How Drug Interactions Work",
+                sections: [
+                    { heading: "🧲 The Magnet Effect (Chelation)", body: "Calcium in milk acts like a tiny magnet. When you take an antibiotic like Ciprofloxacin with milk, the calcium ions bind tightly to the drug molecules, forming an insoluble complex. This 'trapped' drug passes through your gut without ever entering your bloodstream, making your medicine useless." },
+                    { heading: "🔧 The Enzyme Blocker (CYP Inhibition)", body: "Your liver uses enzymes (like CYP3A4) to break down drugs. Grapefruit juice blocks these enzymes. So if you take a statin with grapefruit, the drug isn't broken down and accumulates to dangerously high levels — like pouring water into a sink with a blocked drain." },
+                    { heading: "⚔️ The Tug of War (Receptor Competition)", body: "Some drugs compete for the same receptor or transporter. For example, proteins in food compete with Levodopa for the same intestinal transporter (LAT-1). If you eat a high-protein meal, the food 'wins' and the drug can't get absorbed, reducing its effect on Parkinson's symptoms." }
+                ]
+            }
+        };
+
+        // ==========================================
+        // 4. UI COMPONENTS
+        // ==========================================
+        const SearchInput = ({ value, onChange, placeholder, options, icon }) => {
+            const [isOpen, setIsOpen] = useState(false);
+            const filteredOptions = useMemo(() => {
+                if (!value) return [];
+                return options.filter(opt => opt.toLowerCase().includes(value.toLowerCase()) && opt.toLowerCase() !== value.toLowerCase()).slice(0, 8);
+            }, [value, options]);
+            const handleSelect = (opt) => { const g = ALIAS_MAP[opt]; onChange(g ? `${opt} (${g})` : opt); setIsOpen(false); };
+            const handleKeyDown = (e) => { if (e.key === 'Enter' && isOpen && filteredOptions.length > 0) { handleSelect(filteredOptions[0]); e.preventDefault(); } };
+            return (
+                <div className="relative w-full">
+                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">{icon}</div>
+                    <input type="text" value={value} onChange={(e) => { onChange(e.target.value); setIsOpen(true); }} onFocus={() => setIsOpen(true)} onBlur={() => setTimeout(() => setIsOpen(false), 200)} onKeyDown={handleKeyDown} placeholder={placeholder} className="w-full pl-10 pr-10 py-3 bg-white border border-slate-300 rounded-xl focus:ring-2 focus:ring-medical-500 focus:border-medical-500 outline-none text-slate-800 font-medium transition-shadow shadow-sm" />
+                    {value && (<button onMouseDown={(e) => { e.preventDefault(); onChange(''); setIsOpen(false); }} className="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-red-500 transition-colors"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>)}
+                    {isOpen && filteredOptions.length > 0 && (
+                        <div className="absolute z-20 w-full mt-1 bg-white border border-slate-200 rounded-xl shadow-xl overflow-hidden animate-fade-in">
+                            {filteredOptions.map((opt, i) => (
+                                <div key={i} className="px-4 py-3 hover:bg-slate-50 cursor-pointer text-sm text-slate-700 font-medium border-b border-slate-100 flex items-center justify-between gap-2" onMouseDown={() => handleSelect(opt)}>
+                                    <div className="flex items-center gap-2"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-medical-400"><path d="m9 18 6-6-6-6"/></svg>{opt}</div>
+                                    {ALIAS_MAP[opt] && <span className="text-[10px] text-slate-500 font-medium bg-slate-100 px-2 py-0.5 rounded border border-slate-200 uppercase tracking-wider">Active Ingredient: {ALIAS_MAP[opt]}</span>}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // Modal Component
+        const Modal = ({ isOpen, onClose, children }) => {
+            if (!isOpen) return null;
+            return (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={onClose}>
+                    <div className="absolute inset-0 bg-black/40 backdrop-blur-sm"></div>
+                    <div className="relative bg-white rounded-2xl shadow-2xl max-w-xl w-full max-h-[80vh] overflow-y-auto animate-modal" onClick={(e) => e.stopPropagation()}>
+                        <button onClick={onClose} className="absolute top-4 right-4 p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-700 transition-colors z-10">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                        </button>
+                        {children}
+                    </div>
+                </div>
+            );
+        };
+
+        // Welcome Spotlight Panel
+        const WelcomePanel = ({ onOpenModal }) => (
+            <div className="animate-fade-in">
+                <div className="text-center mb-8 pt-2">
+                    <h2 className="text-2xl font-bold text-slate-800 mb-2">👋 Welcome to PharmAssist AI</h2>
+                    <p className="text-sm text-slate-500 max-w-md mx-auto leading-relaxed">Select a quick demo on the left, type a medication pair, or explore essential safety guides below.</p>
+                </div>
+                <div className="grid grid-cols-3 gap-4">
+                    <button onClick={() => onOpenModal('rx')} className="group bg-white rounded-2xl border border-slate-200 p-5 text-left hover:shadow-lg hover:border-medical-300 transition-all duration-200 flex flex-col h-full">
+                        <span className="text-3xl mb-3 block">📜</span>
+                        <h3 className="text-sm font-bold text-slate-800 mb-3">Read Your Prescription</h3>
+                        <div className="flex flex-wrap gap-1.5 mb-4">
+                            <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 text-[11px] font-bold rounded-md border border-indigo-100">b.i.d.</span>
+                            <span className="px-2 py-0.5 bg-amber-50 text-amber-700 text-[11px] font-bold rounded-md border border-amber-100">a.c.</span>
+                            <span className="px-2 py-0.5 bg-rose-50 text-rose-700 text-[11px] font-bold rounded-md border border-rose-100">s.o.s.</span>
+                        </div>
+                        <span className="text-xs font-semibold text-medical-600 group-hover:text-medical-700 mt-auto">View Common Terms →</span>
+                    </button>
+
+                    <button onClick={() => onOpenModal('storage')} className="group bg-white rounded-2xl border border-slate-200 p-5 text-left hover:shadow-lg hover:border-medical-300 transition-all duration-200 flex flex-col h-full">
+                        <span className="text-3xl mb-3 block">📦</span>
+                        <h3 className="text-sm font-bold text-slate-800 mb-3">Storage & Stability</h3>
+                        <p className="text-xs text-slate-500 leading-relaxed mb-4">Keep pills dry. Refrigerate eye drops. Never store meds in humid bathrooms.</p>
+                        <span className="text-xs font-semibold text-medical-600 group-hover:text-medical-700 mt-auto">Storage Rules →</span>
+                    </button>
+
+                    <button onClick={() => onOpenModal('chemistry')} className="group bg-white rounded-2xl border border-slate-200 p-5 text-left hover:shadow-lg hover:border-medical-300 transition-all duration-200 flex flex-col h-full">
+                        <span className="text-3xl mb-3 block">🧲</span>
+                        <h3 className="text-sm font-bold text-slate-800 mb-3">The Magnet Effect</h3>
+                        <p className="text-xs text-slate-500 leading-relaxed mb-4">Calcium in milk traps antibiotics before they reach your blood.</p>
+                        <span className="text-xs font-semibold text-medical-600 group-hover:text-medical-700 mt-auto">Learn Chemistry →</span>
+                    </button>
+                </div>
+            </div>
+        );
+
+        // ==========================================
+        // 5. MAIN APP
+        // ==========================================
+        const App = () => {
+            const [activeTab, setActiveTab] = useState('DDI');
+            const [ddiDrug1, setDdiDrug1] = useState('');
+            const [ddiDrug2, setDdiDrug2] = useState('');
+            const [dosingDrug, setDosingDrug] = useState('');
+            const [foodDrug, setFoodDrug] = useState('');
+            const [foodItem, setFoodItem] = useState('');
+            const [openModal, setOpenModal] = useState(null);
+
+            // Determine if any tab has an active result to show
+            const hasActiveQuery = useMemo(() => {
+                if (activeTab === 'DDI') return !!(ddiDrug1 || ddiDrug2);
+                if (activeTab === 'DOSING') return !!dosingDrug;
+                if (activeTab === 'FOOD') return !!(foodDrug || foodItem);
+                return false;
+            }, [activeTab, ddiDrug1, ddiDrug2, dosingDrug, foodDrug, foodItem]);
+
+            const ddiResult = useMemo(() => {
+                if (!ddiDrug1 || !ddiDrug2) return null;
+                const d1 = getGenericName(ddiDrug1).toLowerCase().trim();
+                const d2 = getGenericName(ddiDrug2).toLowerCase().trim();
+                if (!ddiKnownGenerics.has(d1) || !ddiKnownGenerics.has(d2)) return 'INCOMPLETE';
+                const match = DDI_DATABASE.find(d => (d.drugA.toLowerCase() === d1 && d.drugB.toLowerCase() === d2) || (d.drugA.toLowerCase() === d2 && d.drugB.toLowerCase() === d1));
+                return match ? match : 'SAFE';
+            }, [ddiDrug1, ddiDrug2]);
+
+            const dosingResult = useMemo(() => {
+                if (!dosingDrug) return null;
+                const d1 = getGenericName(dosingDrug).toLowerCase().trim();
+                if (!dosingKnownGenerics.has(d1)) return 'INCOMPLETE';
+                return DOSING_DATABASE.find(d => d.drugName.toLowerCase() === d1) || 'NOT_FOUND';
+            }, [dosingDrug]);
+
+            const foodResult = useMemo(() => {
+                if (!foodDrug || !foodItem) return null;
+                const d1 = getGenericName(foodDrug).toLowerCase().trim();
+                const f1 = getGenericName(foodItem).toLowerCase().trim();
+                if (!foodKnownDrugs.has(d1) || !foodKnownItems.has(f1)) return 'INCOMPLETE';
+                return FOOD_DATABASE.find(d => d.drugName.toLowerCase() === d1 && d.foodItem.toLowerCase() === f1) || 'SAFE';
+            }, [foodDrug, foodItem]);
+
+            const getSeverityConfig = (severity) => {
+                switch(severity?.toUpperCase()) {
+                    case 'RED': case 'AVOID': return { color: 'bg-red-50 text-red-900 border-red-500', icon: '🛑', title: 'CONTRAINDICATED' };
+                    case 'YELLOW': case 'SPACE OUT': return { color: 'bg-amber-50 text-amber-900 border-amber-500', icon: '⚠️', title: 'MODERATE RISK' };
+                    case 'GREEN': case 'SAFE': return { color: 'bg-emerald-50 text-emerald-900 border-emerald-500', icon: '🟢', title: 'SAFE' };
+                    default: return { color: 'bg-slate-50 text-slate-900 border-slate-500', icon: 'ℹ️', title: 'NO DATA' };
+                }
+            };
+            const getDosingIcon = (val) => { const s = val?.toLowerCase() || ''; if (s.includes('morning')) return '☀️'; if (s.includes('bedtime')||s.includes('evening')||s.includes('night')) return '🌙'; if (s.includes('empty stomach')) return '⚡'; if (s.includes('with food')||s.includes('with meals')) return '🍽️'; return '🕒'; };
+
+            const PillIcon = <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m10.5 20.5 10-10a4.95 4.95 0 1 0-7-7l-10 10a4.95 4.95 0 1 0 7 7Z"/><path d="m8.5 8.5 7 7"/></svg>;
+            const FoodIcon = <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2v20"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>;
+
+            // Action buttons for result cards
+            const ActionButtons = ({ speakFn, bgHover }) => (
+                <div className="flex gap-2 print-hidden">
+                    <button onClick={speakFn} className={`p-2 bg-white rounded-lg shadow-sm hover:${bgHover} transition text-lg`} title="Read Aloud">🔊</button>
+                    <button onClick={() => window.print()} className={`p-2 bg-white rounded-lg shadow-sm hover:${bgHover} transition text-lg`} title="Print Leaflet">📄</button>
+                </div>
+            );
+
+            return (
+                <div className="min-h-screen pb-12 font-sans bg-slate-50">
+                    {/* Nav */}
+                    <nav className="bg-white border-b border-slate-200 sticky top-0 z-10 shadow-sm print-hidden">
+                        <div className="max-w-5xl mx-auto px-6 py-4 flex justify-between items-center">
+                            <div className="flex items-center gap-3">
+                                <div className="w-10 h-10 rounded-lg bg-medical-600 flex items-center justify-center shadow-inner">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m10.5 20.5 10-10a4.95 4.95 0 1 0-7-7l-10 10a4.95 4.95 0 1 0 7 7Z"/><path d="m8.5 8.5 7 7"/></svg>
+                                </div>
+                                <div>
+                                    <h1 className="text-xl font-bold text-slate-900 leading-tight">PharmAssist AI</h1>
+                                    <p className="text-xs font-medium text-slate-500 uppercase tracking-widest">Exhibition Demo Dashboard</p>
+                                </div>
+                            </div>
+                        </div>
+                    </nav>
+
+                    <div className="max-w-5xl mx-auto px-6 mt-8">
+                        {/* Tabs */}
+                        <div className="flex bg-slate-200/50 p-1.5 rounded-2xl mb-8 shadow-inner tabs-nav print-hidden">
+                            <button onClick={() => setActiveTab('DDI')} className={`flex-1 py-3 text-sm font-bold rounded-xl flex justify-center items-center gap-2 transition-all ${activeTab === 'DDI' ? 'bg-white shadow text-medical-700' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}`}>💊 Drug Interactions</button>
+                            <button onClick={() => setActiveTab('DOSING')} className={`flex-1 py-3 text-sm font-bold rounded-xl flex justify-center items-center gap-2 transition-all ${activeTab === 'DOSING' ? 'bg-white shadow text-medical-700' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}`}>⏰ Dosing Guide</button>
+                            <button onClick={() => setActiveTab('FOOD')} className={`flex-1 py-3 text-sm font-bold rounded-xl flex justify-center items-center gap-2 transition-all ${activeTab === 'FOOD' ? 'bg-white shadow text-medical-700' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}`}>🍎 Food Checker</button>
+                        </div>
+
+                        <div className="grid lg:grid-cols-3 gap-8">
+                            {/* Left: Search */}
+                            <div className="lg:col-span-1 space-y-4 search-col print-hidden">
+                                <div className="bg-slate-100 rounded-2xl border border-slate-200 p-5 shadow-sm">
+                                    <h2 className="text-sm font-bold text-slate-800 uppercase tracking-wider mb-4">Live Search</h2>
+                                    {activeTab === 'DDI' && (
+                                        <div className="space-y-4 animate-fade-in">
+                                            <SearchInput value={ddiDrug1} onChange={setDdiDrug1} placeholder="Drug A (e.g. Dolo 650)" options={ddiDrugsList} icon={PillIcon} />
+                                            <div className="flex justify-center -my-2 relative z-10"><span className="bg-slate-100 px-2 text-xs font-bold text-slate-400">AND</span></div>
+                                            <SearchInput value={ddiDrug2} onChange={setDdiDrug2} placeholder="Drug B (e.g. Aspirin)" options={ddiDrugsList} icon={PillIcon} />
+                                            <div className="pt-3">
+                                                <p className="text-xs font-bold text-slate-400 uppercase mb-2">Quick Demos</p>
+                                                <div className="flex flex-wrap gap-2">
+                                                    <button onClick={() => {setDdiDrug1("Dolo 650 (Paracetamol)"); setDdiDrug2("Alcohol");}} className="px-3 py-1.5 bg-white border border-slate-200 hover:border-medical-400 hover:bg-medical-50 text-xs font-semibold text-slate-600 rounded-lg shadow-sm transition-all">Dolo 650 + Alcohol</button>
+                                                    <button onClick={() => {setDdiDrug1("Warfarin"); setDdiDrug2("Aspirin");}} className="px-3 py-1.5 bg-white border border-slate-200 hover:border-medical-400 hover:bg-medical-50 text-xs font-semibold text-slate-600 rounded-lg shadow-sm transition-all">Warfarin + Aspirin</button>
+                                                    <button onClick={() => {setDdiDrug1("Sarpagandha"); setDdiDrug2("MAO Inhibitors");}} className="px-3 py-1.5 bg-white border border-slate-200 hover:border-medical-400 hover:bg-medical-50 text-xs font-semibold text-slate-600 rounded-lg shadow-sm transition-all">Sarpagandha + MAOI</button>
+                                                    <button onClick={() => {setDdiDrug1("Clopidogrel"); setDdiDrug2("Omeprazole");}} className="px-3 py-1.5 bg-white border border-slate-200 hover:border-medical-400 hover:bg-medical-50 text-xs font-semibold text-slate-600 rounded-lg shadow-sm transition-all">Clopidogrel + Omeprazole</button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                    {activeTab === 'DOSING' && (
+                                        <div className="space-y-4 animate-fade-in">
+                                            <SearchInput value={dosingDrug} onChange={setDosingDrug} placeholder="Type Drug Name" options={dosingDrugsList} icon={PillIcon} />
+                                            <div className="pt-3">
+                                                <p className="text-xs font-bold text-slate-400 uppercase mb-2">Quick Demos</p>
+                                                <div className="flex flex-wrap gap-2">
+                                                    <button onClick={() => setDosingDrug("Pantoprazole")} className="px-3 py-1.5 bg-white border border-slate-200 hover:border-medical-400 hover:bg-medical-50 text-xs font-semibold text-slate-600 rounded-lg shadow-sm transition-all">Pantoprazole (Morning)</button>
+                                                    <button onClick={() => setDosingDrug("Montelukast")} className="px-3 py-1.5 bg-white border border-slate-200 hover:border-medical-400 hover:bg-medical-50 text-xs font-semibold text-slate-600 rounded-lg shadow-sm transition-all">Montelukast (Night)</button>
+                                                    <button onClick={() => setDosingDrug("Metformin")} className="px-3 py-1.5 bg-white border border-slate-200 hover:border-medical-400 hover:bg-medical-50 text-xs font-semibold text-slate-600 rounded-lg shadow-sm transition-all">Metformin (With Food)</button>
+                                                    <button onClick={() => setDosingDrug("Levothyroxine")} className="px-3 py-1.5 bg-white border border-slate-200 hover:border-medical-400 hover:bg-medical-50 text-xs font-semibold text-slate-600 rounded-lg shadow-sm transition-all">Levothyroxine (Empty Stomach)</button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                    {activeTab === 'FOOD' && (
+                                        <div className="space-y-4 animate-fade-in">
+                                            <SearchInput value={foodDrug} onChange={setFoodDrug} placeholder="Drug (e.g. Allegra)" options={foodDrugsList} icon={PillIcon} />
+                                            <div className="flex justify-center -my-2 relative z-10"><span className="bg-slate-100 px-2 text-xs font-bold text-slate-400">WITH</span></div>
+                                            <SearchInput value={foodItem} onChange={setFoodItem} placeholder="Food (e.g. Grapefruit Juice)" options={foodItemsList} icon={FoodIcon} />
+                                            <div className="pt-3">
+                                                <p className="text-xs font-bold text-slate-400 uppercase mb-2">Quick Demos</p>
+                                                <div className="flex flex-wrap gap-2">
+                                                    <button onClick={() => {setFoodDrug("Atorvastatin"); setFoodItem("Grapefruit Juice");}} className="px-3 py-1.5 bg-white border border-slate-200 hover:border-medical-400 hover:bg-medical-50 text-xs font-semibold text-slate-600 rounded-lg shadow-sm transition-all">Atorvastatin + Grapefruit</button>
+                                                    <button onClick={() => {setFoodDrug("Ciprofloxacin"); setFoodItem("Milk / Dairy / Calcium");}} className="px-3 py-1.5 bg-white border border-slate-200 hover:border-medical-400 hover:bg-medical-50 text-xs font-semibold text-slate-600 rounded-lg shadow-sm transition-all">Ciprofloxacin + Milk</button>
+                                                    <button onClick={() => {setFoodDrug("Levodopa"); setFoodItem("High-Protein Meals");}} className="px-3 py-1.5 bg-white border border-slate-200 hover:border-medical-400 hover:bg-medical-50 text-xs font-semibold text-slate-600 rounded-lg shadow-sm transition-all">Levodopa + Protein</button>
+                                                    <button onClick={() => {setFoodDrug("Warfarin"); setFoodItem("Green Leafy Vegetables (Vitamin K)");}} className="px-3 py-1.5 bg-white border border-slate-200 hover:border-medical-400 hover:bg-medical-50 text-xs font-semibold text-slate-600 rounded-lg shadow-sm transition-all">Warfarin + Spinach</button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Right: Output */}
+                            <div className="lg:col-span-2 output-col">
+
+                                {/* ===== WELCOME SPOTLIGHT (shown when no query is active) ===== */}
+                                {!hasActiveQuery && <WelcomePanel onOpenModal={setOpenModal} />}
+
+                                {/* ===== DDI RESULTS ===== */}
+                                {hasActiveQuery && activeTab === 'DDI' && (
+                                    ddiResult === 'INCOMPLETE' ? (
+                                        <div className="h-full min-h-[300px] border-2 border-dashed border-slate-200 rounded-2xl flex flex-col items-center justify-center text-center p-10 bg-white print-hidden animate-fade-in">
+                                            <p className="text-3xl mb-3">🔍</p>
+                                            <h3 className="text-lg font-bold text-slate-700 mb-1">Select to analyze</h3>
+                                            <p className="text-sm text-slate-400">Pick a valid medication from the suggestions.</p>
+                                        </div>
+                                    ) : ddiResult === 'SAFE' ? (
+                                        <div className="bg-white rounded-2xl shadow-lg border border-emerald-200 overflow-hidden animate-fade-in result-card">
+                                            <div className="p-5 border-b border-emerald-100 bg-emerald-50 text-emerald-900 flex justify-between items-center">
+                                                <div className="flex items-center gap-4">
+                                                    <div className="bg-white p-2.5 rounded-full shadow-sm text-2xl">🟢</div>
+                                                    <div><h3 className="text-lg font-black uppercase tracking-wide">SAFE COMBINATION</h3><p className="text-sm font-bold opacity-90 mt-0.5">{getGenericName(ddiDrug1)} + {getGenericName(ddiDrug2)}</p></div>
+                                                </div>
+                                                <ActionButtons speakFn={() => speakText(`${getGenericName(ddiDrug1)} and ${getGenericName(ddiDrug2)} is generally safe.`)} bgHover="bg-emerald-100" />
+                                            </div>
+                                            <div className="p-6"><p className="text-slate-700 font-medium leading-relaxed">No Major Adverse Interaction Known. This combination is generally safe under standard therapeutic use.</p></div>
+                                        </div>
+                                    ) : ddiResult ? (
+                                        <div className="bg-white rounded-2xl shadow-lg border border-slate-200 overflow-hidden animate-fade-in result-card">
+                                            <div className={`p-5 border-b ${getSeverityConfig(ddiResult.severity).color} flex justify-between items-center`}>
+                                                <div className="flex items-center gap-4">
+                                                    <div className="bg-white p-2.5 rounded-full shadow-sm text-2xl">{getSeverityConfig(ddiResult.severity).icon}</div>
+                                                    <div><h3 className="text-lg font-black uppercase tracking-wide">{getSeverityConfig(ddiResult.severity).title}</h3><p className="text-sm font-bold opacity-90 mt-0.5">{ddiResult.drugA} + {ddiResult.drugB}</p></div>
+                                                </div>
+                                                <ActionButtons speakFn={() => speakText(`${ddiResult.drugA} and ${ddiResult.drugB}. Severity: ${ddiResult.severity}. ${ddiResult.mechanism}`)} bgHover="bg-red-100" />
+                                            </div>
+                                            <div className="p-6 space-y-6">
+                                                <div><h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-2">Mechanism</h4><p className="text-slate-700 font-medium bg-slate-50 p-4 rounded-xl border border-slate-100">{ddiResult.mechanism}</p></div>
+                                                <div className="grid md:grid-cols-2 gap-6">
+                                                    <div><h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-3">Clinical Risks</h4><ul className="space-y-2">{ddiResult.clinicalRisks.map((r,i) => <li key={i} className="flex gap-2 text-sm text-slate-700"><span className="text-rose-400">•</span>{r}</li>)}</ul></div>
+                                                    <div><h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-3">Management</h4><ul className="space-y-3">{ddiResult.management.map((s,i) => <li key={i} className="flex gap-3 text-sm text-slate-700"><span className="flex-shrink-0 w-5 h-5 rounded-full bg-slate-200 text-slate-800 flex items-center justify-center text-[10px] font-bold mt-0.5">{i+1}</span>{s}</li>)}</ul></div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ) : null
+                                )}
+
+                                {/* ===== DOSING RESULTS ===== */}
+                                {hasActiveQuery && activeTab === 'DOSING' && (
+                                    dosingResult === 'INCOMPLETE' ? (
+                                        <div className="h-full min-h-[300px] border-2 border-dashed border-slate-200 rounded-2xl flex flex-col items-center justify-center text-center p-10 bg-white print-hidden animate-fade-in">
+                                            <p className="text-3xl mb-3">🔍</p>
+                                            <h3 className="text-lg font-bold text-slate-700 mb-1">Select to analyze</h3>
+                                            <p className="text-sm text-slate-400">Pick a valid medication from the suggestions.</p>
+                                        </div>
+                                    ) : dosingResult && typeof dosingResult === 'object' ? (
+                                        <div className="bg-white rounded-2xl shadow-lg border border-slate-200 overflow-hidden animate-fade-in result-card">
+                                            <div className="p-5 border-b border-slate-100 bg-indigo-50 text-indigo-900 flex justify-between items-center">
+                                                <div className="flex items-center gap-4">
+                                                    <div className="bg-white p-2.5 rounded-full shadow-sm text-2xl">⏰</div>
+                                                    <div><h3 className="text-lg font-black uppercase tracking-wide">Dosing Guide</h3><p className="text-sm font-bold opacity-90 mt-0.5">{dosingResult.drugName}</p></div>
+                                                </div>
+                                                <ActionButtons speakFn={() => speakText(`${dosingResult.drugName}. Best time: ${dosingResult.bestTime}. ${dosingResult.instructions}`)} bgHover="bg-indigo-100" />
+                                            </div>
+                                            <div className="p-6 space-y-6">
+                                                <div className="flex gap-4">
+                                                    <div className="flex-1 bg-white border border-slate-200 p-5 rounded-xl shadow-sm text-center flex flex-col items-center">
+                                                        <span className="text-3xl mb-2">{getDosingIcon(dosingResult.bestTime)}</span>
+                                                        <p className="text-xs font-bold text-slate-400 uppercase mb-1">Time of Day</p>
+                                                        <p className="text-sm font-bold text-indigo-700">{dosingResult.bestTime}</p>
+                                                    </div>
+                                                    <div className="flex-1 bg-white border border-slate-200 p-5 rounded-xl shadow-sm text-center flex flex-col items-center">
+                                                        <span className="text-3xl mb-2">{getDosingIcon(dosingResult.foodTiming)}</span>
+                                                        <p className="text-xs font-bold text-slate-400 uppercase mb-1">Food Timing</p>
+                                                        <p className="text-sm font-bold text-teal-700">{dosingResult.foodTiming}</p>
+                                                    </div>
+                                                </div>
+                                                <div><h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-2">Instructions</h4><p className="text-slate-700 font-medium bg-slate-50 p-4 rounded-xl border border-slate-100">{dosingResult.instructions}</p></div>
+                                            </div>
+                                        </div>
+                                    ) : null
+                                )}
+
+                                {/* ===== FOOD RESULTS ===== */}
+                                {hasActiveQuery && activeTab === 'FOOD' && (
+                                    foodResult === 'INCOMPLETE' ? (
+                                        <div className="h-full min-h-[300px] border-2 border-dashed border-slate-200 rounded-2xl flex flex-col items-center justify-center text-center p-10 bg-white print-hidden animate-fade-in">
+                                            <p className="text-3xl mb-3">🔍</p>
+                                            <h3 className="text-lg font-bold text-slate-700 mb-1">Select to analyze</h3>
+                                            <p className="text-sm text-slate-400">Pick a valid drug and food item from the suggestions.</p>
+                                        </div>
+                                    ) : foodResult === 'SAFE' ? (
+                                        <div className="bg-white rounded-2xl shadow-lg border border-emerald-200 overflow-hidden animate-fade-in result-card">
+                                            <div className="p-5 border-b border-emerald-100 bg-emerald-50 text-emerald-900 flex justify-between items-center">
+                                                <div className="flex items-center gap-4">
+                                                    <div className="bg-white p-2.5 rounded-full shadow-sm text-2xl">🟢</div>
+                                                    <div><h3 className="text-lg font-black uppercase tracking-wide">SAFE COMBINATION</h3><p className="text-sm font-bold opacity-90 mt-0.5">{getGenericName(foodDrug)} + {getGenericName(foodItem)}</p></div>
+                                                </div>
+                                                <ActionButtons speakFn={() => speakText(`${getGenericName(foodDrug)} and ${getGenericName(foodItem)} is generally safe.`)} bgHover="bg-emerald-100" />
+                                            </div>
+                                            <div className="p-6"><p className="text-slate-700 font-medium leading-relaxed">No Major Adverse Interaction Known. Generally safe under standard therapeutic use.</p></div>
+                                        </div>
+                                    ) : foodResult && typeof foodResult === 'object' ? (
+                                        <div className="bg-white rounded-2xl shadow-lg border border-slate-200 overflow-hidden animate-fade-in result-card">
+                                            <div className={`p-5 border-b ${getSeverityConfig(foodResult.safetyVerdict).color} flex justify-between items-center`}>
+                                                <div className="flex items-center gap-4">
+                                                    <div className="bg-white p-2.5 rounded-full shadow-sm text-2xl">{getSeverityConfig(foodResult.safetyVerdict).icon}</div>
+                                                    <div><h3 className="text-lg font-black uppercase tracking-wide">{getSeverityConfig(foodResult.safetyVerdict).title}</h3><p className="text-sm font-bold opacity-90 mt-0.5">{foodResult.drugName} + {foodResult.foodItem}</p></div>
+                                                </div>
+                                                <ActionButtons speakFn={() => speakText(`${foodResult.drugName} and ${foodResult.foodItem}. ${foodResult.patientAdvice}`)} bgHover="bg-amber-100" />
+                                            </div>
+                                            <div className="p-6 space-y-6">
+                                                <div><h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-2">Mechanism</h4><p className="text-slate-700 font-medium bg-slate-50 p-4 rounded-xl border border-slate-100">{foodResult.mechanism}</p></div>
+                                                <div><h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-2">Patient Advice</h4><div className="flex gap-3 items-start bg-blue-50 text-blue-900 p-4 rounded-xl border border-blue-100"><p className="text-sm font-medium leading-relaxed">{foodResult.patientAdvice}</p></div></div>
+                                            </div>
+                                        </div>
+                                    ) : null
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* ===== MODALS ===== */}
+                    <Modal isOpen={openModal === 'rx'} onClose={() => setOpenModal(null)}>
+                        <div className="p-8">
+                            <h2 className="text-xl font-bold text-slate-900 mb-6">{MODAL_DATA.rx.title}</h2>
+                            <div className="space-y-3">
+                                {MODAL_DATA.rx.content.map((item, i) => (
+                                    <div key={i} className="flex items-center gap-4 p-3 bg-slate-50 rounded-xl border border-slate-100">
+                                        <span className="font-mono font-bold text-sm text-indigo-700 bg-indigo-50 px-3 py-1 rounded-lg border border-indigo-100 min-w-[70px] text-center">{item.abbr}</span>
+                                        <span className="text-sm text-slate-700 font-medium">{item.meaning}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </Modal>
+
+                    <Modal isOpen={openModal === 'storage'} onClose={() => setOpenModal(null)}>
+                        <div className="p-8">
+                            <h2 className="text-xl font-bold text-slate-900 mb-6">{MODAL_DATA.storage.title}</h2>
+                            <div className="space-y-4">
+                                {MODAL_DATA.storage.tips.map((tip, i) => (
+                                    <div key={i} className="flex items-start gap-4 p-4 bg-slate-50 rounded-xl border border-slate-100">
+                                        <span className="text-2xl flex-shrink-0">{tip.icon}</span>
+                                        <p className="text-sm text-slate-700 font-medium leading-relaxed">{tip.rule}</p>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </Modal>
+
+                    <Modal isOpen={openModal === 'chemistry'} onClose={() => setOpenModal(null)}>
+                        <div className="p-8">
+                            <h2 className="text-xl font-bold text-slate-900 mb-6">{MODAL_DATA.chemistry.title}</h2>
+                            <div className="space-y-6">
+                                {MODAL_DATA.chemistry.sections.map((sec, i) => (
+                                    <div key={i} className="p-5 bg-slate-50 rounded-xl border border-slate-100">
+                                        <h3 className="text-sm font-bold text-slate-800 mb-2">{sec.heading}</h3>
+                                        <p className="text-sm text-slate-600 leading-relaxed">{sec.body}</p>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </Modal>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
